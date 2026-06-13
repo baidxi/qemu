@@ -180,6 +180,13 @@ static void mt7621_gpio_reset_hold(Object *obj, ResetType type)
 
     for (int i = 0; i < NUM_BANKS; i++) {
         memset(&s->bank[i], 0, sizeof(MT7621GPIOBank));
+        /*
+         * Input pins default to high (pull-up resistors on real HW).
+         * Buttons (WPS, reset) are active-low, so data=0 would make
+         * Breed think a button is pressed and abort the autoboot
+         * countdown.  Set all pins high to prevent false button presses.
+         */
+        s->bank[i].data = 0xFFFFFFFF;
     }
 }
 

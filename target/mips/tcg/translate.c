@@ -31,16 +31,47 @@
 #include "semihosting/semihost.h"
 #include "trace.h"
 #include "fpu_helper.h"
+#include "hw/mips/mips_tcg_fixup.h"
 
 /*
- * Optional single-instruction patch point.
- * Machine init code can set these to replace one instruction at a
- * specific virtual address during TCG translation.  Defaults to
- * disabled (vaddr == 0), so only machines that opt in are affected.
+ * Single-instruction fixup state.
+ * Machine init code calls mips_tcg_fixup() to register a replacement
+ * opcode at a specific virtual address.  Defaults to disabled
+ * (vaddr == 0), so only machines that opt in are affected.
+ *
+ * Modes (selected via the vaddr field):
+ *   0  — disabled (no fixup applied)
+ *   1  — wildcard: match @orig at any address
+ *   2  — pattern:  match @orig at any address AND verify @ctx_opcode
+ *                  at @ctx_offset bytes from current PC
+ *   >2 — address-specific: match @orig only at the given vaddr
  */
-target_ulong mips_patch_vaddr = 0;
-uint32_t mips_patch_orig_opcode = 0;
-uint32_t mips_patch_new_opcode = 0;
+static struct {
+    target_ulong vaddr;
+    uint32_t     orig;
+    uint32_t     neu;
+    uint32_t     ctx_opcode;  /* context instruction for pattern mode (vaddr==2) */
+    int          ctx_offset;  /* byte offset of context instruction (negative = before) */
+} mips_fixup;
+
+void mips_tcg_fixup(target_ulong vaddr, uint32_t orig, uint32_t neu)
+{
+    mips_fixup.vaddr = vaddr;
+    mips_fixup.orig  = orig;
+    mips_fixup.neu   = neu;
+    mips_fixup.ctx_opcode = 0;
+    mips_fixup.ctx_offset = 0;
+}
+
+void mips_tcg_fixup_pattern(uint32_t target_opcode, uint32_t neu,
+                             uint32_t ctx_opcode, int ctx_offset)
+{
+    mips_fixup.vaddr      = 2;  /* pattern mode */
+    mips_fixup.orig       = target_opcode;
+    mips_fixup.neu        = neu;
+    mips_fixup.ctx_opcode = ctx_opcode;
+    mips_fixup.ctx_offset = ctx_offset;
+}
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -15173,14 +15204,37 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
                                          mo_endian(ctx));
         /*
          * Optional instruction patch point.
-         * Machine code can set mips_patch_vaddr/orig/new to replace a
-         * specific instruction at a specific address.  Defaults to
-         * disabled (vaddr == 0), so other machines are unaffected.
+         * Machine init code can set mips_fixup fields to transparently
+         * replace instructions before decoding.  Defaults to disabled
+         * (vaddr == 0), so only machines that opt in are affected.
+         *
+         * Modes:
+         *   vaddr == 1 ("wildcard"): match @orig at ANY address.
+         *   vaddr == 2 ("pattern"):  match @orig at any address AND
+         *     verify a context instruction at @ctx_offset bytes.  This
+         *     disambiguates opcodes that appear legitimately elsewhere.
+         *   vaddr > 2: address-specific match at the given vaddr.
          */
-        if (mips_patch_vaddr != 0 &&
-            ctx->base.pc_next == mips_patch_vaddr &&
-            ctx->opcode == mips_patch_orig_opcode) {
-            ctx->opcode = mips_patch_new_opcode;
+        if (mips_fixup.orig != 0 && ctx->opcode == mips_fixup.orig) {
+            bool apply_fixup = false;
+
+            if (mips_fixup.vaddr > 2) {
+                /* Address-specific mode */
+                apply_fixup = (ctx->base.pc_next == mips_fixup.vaddr);
+            } else if (mips_fixup.vaddr == 2) {
+                /* Pattern mode: read and verify context instruction */
+                uint32_t ctx_insn = translator_ldl_end(env, &ctx->base,
+                    ctx->base.pc_next + mips_fixup.ctx_offset,
+                    mo_endian(ctx));
+                apply_fixup = (ctx_insn == mips_fixup.ctx_opcode);
+            } else if (mips_fixup.vaddr == 1) {
+                /* Pure wildcard mode */
+                apply_fixup = true;
+            }
+
+            if (apply_fixup) {
+                ctx->opcode = mips_fixup.neu;
+            }
         }
         insn_bytes = 4;
         decode_opc(env, ctx);
