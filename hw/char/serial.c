@@ -602,7 +602,6 @@ static int serial_can_receive1(void *opaque)
 static void serial_receive1(void *opaque, const uint8_t *buf, int size)
 {
     SerialState *s = opaque;
-
     if (s->wakeup) {
         qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
     }

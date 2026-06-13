@@ -97,6 +97,14 @@ static uint64_t gcr_read(void *opaque, hwaddr addr, unsigned size)
         /* L2 BYPASS */
         return GCR_L2_CONFIG_BYPASS_MSK;
         /* Core-Local and Core-Other Control Blocks */
+    case MIPS_CLCB_OFS + 0x0008:   /* CL_STATUS (VPE power/reset status) */
+    case MIPS_COCB_OFS + 0x0008:
+        /*
+         * Return VPE powered-on + reset-complete.
+         * Breed polls COCB+0x08 waiting for VPE1 to be ready.
+         * With 1 VPE, always return "done" for the other VPE.
+         */
+        return 3;   /* powered + reset done */
     case MIPS_CLCB_OFS + GCR_CL_CONFIG_OFS:
     case MIPS_COCB_OFS + GCR_CL_CONFIG_OFS:
         /* Set PVP to # of VPs - 1 */

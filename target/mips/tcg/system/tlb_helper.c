@@ -1080,11 +1080,29 @@ void mips_cpu_do_interrupt(CPUState *cs)
         env->CP0_Debug |= 1 << CP0DB_DIB;
         goto set_DEPC;
     case EXCP_DBp:
+        /*
+         * On real MT7621 hardware, the boot ROM's EJTAG debug handler at
+         * exception_base + 0x480 processes SDBBP instructions and returns
+         * via DERET. When running firmware (e.g. Breed) directly without
+         * the boot ROM, entering debug mode (MIPS_HFLAG_DM) traps the CPU
+         * permanently — the firmware has no DERET instruction, so DM stays
+         * set and all interrupts are blocked forever.
+         *
+         * Instead, forward to the debug handler vector WITHOUT entering
+         * debug mode. The firmware code at the debug vector runs normally
+         * with interrupts enabled. This is functionally equivalent to
+         * what the real boot ROM does (process SDBBP, then DERET), except
+         * we skip the debug-mode entry/exit dance entirely.
+         */
         env->CP0_Debug |= 1 << CP0DB_DBp;
-        /* Setup DExcCode - SDBBP instruction */
         env->CP0_Debug = (env->CP0_Debug & ~(0x1fULL << CP0DB_DEC)) |
                          (9 << CP0DB_DEC);
-        goto set_DEPC;
+        env->CP0_DEPC = exception_resume_pc(env);
+        env->hflags &= ~MIPS_HFLAG_BMASK;
+        env->active_tc.PC = env->exception_base + 0x480;
+        set_hflags_for_handler(env);
+        cs->exception_index = EXCP_NONE;
+        return;
     case EXCP_DDBS:
         env->CP0_Debug |= 1 << CP0DB_DDBS;
         goto set_DEPC;
@@ -1094,7 +1112,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
         env->CP0_DEPC = exception_resume_pc(env);
         env->hflags &= ~MIPS_HFLAG_BMASK;
  enter_debug_mode:
-        if (env->insn_flags & ISA_MIPS3) {
+     if (env->insn_flags & ISA_MIPS3) {
             env->hflags |= MIPS_HFLAG_64;
             if (!(env->insn_flags & ISA_MIPS_R6) ||
                 env->CP0_Status & (1 << CP0St_KX)) {
@@ -1253,6 +1271,12 @@ void mips_cpu_do_interrupt(CPUState *cs)
         update_badinstr = 1;
         goto set_EPC;
     case EXCP_TRAP:
+        /* Breed-workaround: DDR PHY check at 0x9bfbc4c4 triggers Trap.
+         * Skip silently so Breed can reach its console. */
+        if (env->active_tc.PC == 0x9bfbc4c4) {
+            env->active_tc.PC += 4;
+            return;
+        }
         cause = 13;
         update_badinstr = 1;
         goto set_EPC;

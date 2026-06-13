@@ -32,6 +32,16 @@
 #include "trace.h"
 #include "fpu_helper.h"
 
+/*
+ * Optional single-instruction patch point.
+ * Machine init code can set these to replace one instruction at a
+ * specific virtual address during TCG translation.  Defaults to
+ * disabled (vaddr == 0), so only machines that opt in are affected.
+ */
+target_ulong mips_patch_vaddr = 0;
+uint32_t mips_patch_orig_opcode = 0;
+uint32_t mips_patch_new_opcode = 0;
+
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
 #undef  HELPER_H
@@ -15161,6 +15171,17 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     } else if (!(ctx->hflags & MIPS_HFLAG_M16)) {
         ctx->opcode = translator_ldl_end(env, &ctx->base, ctx->base.pc_next,
                                          mo_endian(ctx));
+        /*
+         * Optional instruction patch point.
+         * Machine code can set mips_patch_vaddr/orig/new to replace a
+         * specific instruction at a specific address.  Defaults to
+         * disabled (vaddr == 0), so other machines are unaffected.
+         */
+        if (mips_patch_vaddr != 0 &&
+            ctx->base.pc_next == mips_patch_vaddr &&
+            ctx->opcode == mips_patch_orig_opcode) {
+            ctx->opcode = mips_patch_new_opcode;
+        }
         insn_bytes = 4;
         decode_opc(env, ctx);
     } else if (ctx->insn_flags & ASE_MICROMIPS) {

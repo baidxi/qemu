@@ -84,5 +84,21 @@ config MIPS_BOSTON
     select AHCI_ICH9
     select SERIAL_MM
 
+config MT7621
+    bool
+    default y
+    depends on MIPS && !TARGET_BIG_ENDIAN && FDT
+    select MIPS_CPS
+    select SERIAL_MM
+    select DEVICE_TREE
+    select MT7621_SYSCTL
+    select MT7621_TIMER
+    select MT7621_MEMCTRL
+    select MT7621_GPIO
+    select MT7621_SPI
+    select SSI_M25P80
+    select MT7621_ETH
+    select UNIMP
+
 config FW_CFG_MIPS
     bool

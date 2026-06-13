@@ -135,6 +135,12 @@ config RISCV_MIPS_CPC
 config RISCV_MIPS_CPS
     bool
 
+config MT7621_SYSCTL
+    bool
+
+config MT7621_MEMCTRL
+    bool
+
 config MPS2_FPGAIO
     bool
     select LED

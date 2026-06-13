@@ -65,3 +65,7 @@ config STELLARIS_GPTM
 
 config AVR_TIMER16
     bool
+
+config MT7621_TIMER
+    bool
+    select PTIMER

@@ -360,17 +360,31 @@ static void gic_reset(void *opaque)
     for (i = 0; i < gic->num_vps; i++) {
         gic->vps[i].ctl         = 0x0;
         gic->vps[i].pend        = 0x0;
-        /* PERFCNT, TIMER and WD not implemented */
-        gic->vps[i].mask        = 0x32;
+        /*
+         * PERFCNT, TIMER and WD not implemented.
+         * Do not enable the CMP (compare) local interrupt (bit 1).
+         * The GIC compare timer fires after ~43s (compare=0xFFFFFFFF at
+         * 100MHz). Breed firmware never acknowledges it, causing an
+         * interrupt storm that freezes the terminal.
+         */
+        gic->vps[i].mask        = 0x30;
         gic->vps[i].compare_map = GIC_MAP_TO_PIN_MSK;
         mips_gictimer_store_vp_compare(gic->gic_timer, i, 0xffffffff);
         gic->vps[i].other_addr  = 0x0;
     }
+    /*
+     * MT7621 boot ROM pre-maps all shared GIC interrupts to VP0 on pin 0
+     * (IP2) before the bootloader runs. The bootloader (e.g. Breed) only
+     * writes GIC_SH_SMASK to enable specific interrupts, relying on the
+     * pre-configured map_vp/map_pin. Set map_vp=0 so that enabled
+     * interrupts are forwarded to VP0. Interrupts remain disabled by
+     * default (enabled=0), so no spurious interrupts fire.
+     */
     for (i = 0; i < gic->num_irq; i++) {
         gic->irq_state[i].enabled = 0;
         gic->irq_state[i].pending = 0;
         gic->irq_state[i].map_pin = GIC_MAP_TO_PIN_MSK;
-        gic->irq_state[i].map_vp  = -1;
+        gic->irq_state[i].map_vp  = 0;
     }
     mips_gictimer_store_sh_count(gic->gic_timer, 0);
     /* COUNTSTOP = 0 */

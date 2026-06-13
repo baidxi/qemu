@@ -70,3 +70,5 @@ stub_ss.add(files('rocker/rocker-stubs.c'))
 system_ss.add(files('rocker/rocker-hmp-cmds.c'))
 
 subdir('can')
+
+specific_ss.add(when: 'CONFIG_MT7621_ETH', if_true: files('mt7621_eth.c'))

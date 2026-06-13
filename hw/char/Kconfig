@@ -95,3 +95,5 @@ config IP_OCTAL_232
     bool
     default y
     depends on IPACK
+config MT7621_UART
+    bool
