@@ -137,18 +137,28 @@ static bool mips_cpu_has_work(CPUState *cs)
     CPUMIPSState *env = cpu_env(cs);
     bool has_work = false;
 
-    /*
-     * Prior to MIPS Release 6 it is implementation dependent if non-enabled
-     * interrupts wake-up the CPU, however most of the implementations only
-     * check for interrupts that can be taken. For pre-release 6 CPUs,
-     * check for CP0 Config7 'Wait IE ignore' bit.
-     */
-    if (cpu_test_interrupt(cs, CPU_INTERRUPT_HARD) &&
-        cpu_mips_hw_interrupts_pending(env)) {
-        if (cpu_mips_hw_interrupts_enabled(env) ||
-            (env->CP0_Config7 & (1 << CP0C7_WII)) ||
-            (env->insn_flags & ISA_MIPS_R6)) {
+    if (cpu_test_interrupt(cs, CPU_INTERRUPT_HARD)) {
+        if (cpu_mips_hw_interrupts_pending(env)) {
             has_work = true;
+        } else {
+            /*
+             * On real MIPS hardware (including 1004Kc / MT7621), the WAIT
+             * instruction resumes execution whenever a hardware interrupt
+             * is pending AND its corresponding IM mask bit is set —
+             * regardless of the global IE flag.  IE only controls whether
+             * the interrupt exception is actually taken.  QEMU's original
+             * model wrongly requires IE=1 for the CPU to leave WAIT,
+             * causing guests that temporarily clear IE (e.g. Breed's ISR
+             * which returns with IE=0) to hang forever.
+             *
+             * Check (Cause & Status) for the IP/IM bits to decide whether
+             * the CPU should wake, even if IE is cleared.
+             */
+            int32_t unmasked = (env->CP0_Cause & env->CP0_Status) &
+                               (0xFFU << CP0Ca_IP);
+            if (unmasked) {
+                has_work = true;
+            }
         }
     }
 

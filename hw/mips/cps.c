@@ -137,6 +137,8 @@ static void mips_cps_realize(DeviceState *dev, Error **errp)
                             &error_abort);
     object_property_set_uint(OBJECT(&s->gic), "num-irq", 128,
                             &error_abort);
+    object_property_set_uint(OBJECT(&s->gic), "clock-freq",
+                            clock_get_hz(s->clock), &error_abort);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->gic), errp)) {
         return;
     }

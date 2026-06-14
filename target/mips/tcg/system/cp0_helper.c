@@ -1129,6 +1129,14 @@ void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
     cpu_mips_store_status(env, arg1);
     val = env->CP0_Status;
 
+    /* Trace IE bit changes (rate-limited to avoid terminal flooding) */
+    if ((old ^ val) & (1 << CP0St_IE)) {
+        static int ie_trace_cnt;
+        if (ie_trace_cnt < 100) {
+            ie_trace_cnt++;
+        }
+    }
+
     if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
         qemu_log("Status %08x (%08x) => %08x (%08x) Cause %08x",
                 old, old & env->CP0_Cause & CP0Ca_IP_mask,

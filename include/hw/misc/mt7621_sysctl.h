@@ -17,6 +17,15 @@ struct MT7621SysctlState {
 
     MemoryRegion iomem;
     uint32_t regs[0x100 / 4];   /* 256 bytes (REG_COUNT) */
+
+    /*
+     * SPI flash size in bytes. Selects the SYSCFG.CHIP_MODE boot device:
+     *   <= 16 MiB -> SPI-NOR 3-Byte addressing (mode 2)
+     *   >  16 MiB -> SPI-NOR 4-Byte addressing (mode 3)
+     * (> 32 MiB would be NAND, but QEMU rejects flashes > 32 MiB.)
+     * Set by the machine model via the "flash-size" property.
+     */
+    uint32_t flash_size;
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(MT7621SysctlState, MT7621_SYSCTL)

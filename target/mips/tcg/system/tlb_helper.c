@@ -1158,6 +1158,12 @@ void mips_cpu_do_interrupt(CPUState *cs)
         break;
     case EXCP_EXT_INTERRUPT:
         cause = 0;
+        {
+            static int ext_int_cnt;
+            if (ext_int_cnt < 20) {
+                ext_int_cnt++;
+            }
+        }
         if (env->CP0_Cause & (1 << CP0Ca_IV)) {
             uint32_t spacing = (env->CP0_IntCtl >> CP0IntCtl_VS) & 0x1f;
 
@@ -1385,6 +1391,17 @@ bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
     if (interrupt_request & CPU_INTERRUPT_HARD) {
         CPUMIPSState *env = cpu_env(cs);
+
+        /*
+         * Diagnostic: when IP2 (ETH) is in Cause, trace whether
+         * interrupts are enabled/pending at this moment.
+         */
+        if (env->CP0_Cause & (1 << (CP0Ca_IP + 2))) {
+            static int ip2_exec_cnt;
+            if (ip2_exec_cnt < 30) {
+                ip2_exec_cnt++;
+            }
+        }
 
         if (cpu_mips_hw_interrupts_enabled(env) &&
             cpu_mips_hw_interrupts_pending(env)) {

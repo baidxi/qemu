@@ -26,6 +26,7 @@
 #include "hw/misc/mips_itu.h"
 #include "hw/core/qdev-properties.h"
 #include "target/mips/cpu.h"
+#include "qemu/main-loop.h"     /* bql_lock/unlock for itc_reconfigure */
 
 #define ITC_TAG_ADDRSPACE_SZ (ITC_ADDRESSMAP_NUM * 8)
 /* Initialize as 4kB area to fit all 32 cells with default 128B grain.
@@ -94,6 +95,18 @@ static void itc_reconfigure(MIPSITUState *tag)
     uint64_t size = (1 * KiB) + (am[1] & ITC_AM1_ADDR_MASK_MASK);
     bool is_enabled = (am[0] & ITC_AM0_EN_MASK) != 0;
 
+    /*
+     * itc_reconfigure() is called both from itc_realize() (during
+     * device creation, BQL held) and from itc_tag_write() (an MMIO
+     * handler reached via TCG-generated code in MTTCG mode, where the
+     * BQL may NOT be held).  Memory-region updates require the BQL, so
+     * acquire it here when it is not already held.
+     */
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
+
     memory_region_transaction_begin();
     if (!(size & (size - 1))) {
         memory_region_set_size(mr, size);
@@ -101,6 +114,10 @@ static void itc_reconfigure(MIPSITUState *tag)
     memory_region_set_address(mr, address);
     memory_region_set_enabled(mr, is_enabled);
     memory_region_transaction_commit();
+
+    if (need_bql) {
+        bql_unlock();
+    }
 }
 
 static void itc_tag_write(void *opaque, hwaddr addr,

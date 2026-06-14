@@ -3,7 +3,7 @@
  *
  * Register map from MT7621 Programming Guide:
  *   0x00  CHIPID0_3    "MT76" ASCII (R)
- *   0x04  CHIPID4_7    "21\x00\x00" ASCII (R)
+ *   0x04  CHIPID4_7    "21  " ASCII (R)  -> 0x20203132 == MT7621_CHIP_NAME1
  *   0x0C  CHIP_REV_ID  Chip Revision Identification (R)
  *   0x10  SYSCFG       System Configuration (RW)
  *   0x14  SYSCFG1      System Configuration 1 (RW)
@@ -25,6 +25,7 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "hw/misc/mt7621_sysctl.h"
+#include "hw/core/qdev-properties.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 
@@ -125,9 +126,20 @@ static void mt7621_sysctl_reset_hold(Object *obj, ResetType type)
     MT7621SysctlState *s = MT7621_SYSCTL(obj);
     memset(s->regs, 0, sizeof(s->regs));
 
-    s->regs[CHIPID0_3 >> 2] = 0x3637544D;    /* "MT76" */
-    s->regs[CHIPID4_7 >> 2] = 0x00003132;    /* "21\x00\x00" */
+    s->regs[CHIPID0_3 >> 2] = 0x3637544D;    /* "MT76" == MT7621_CHIP_NAME0 */
+    s->regs[CHIPID4_7 >> 2] = 0x20203132;    /* "21  " == MT7621_CHIP_NAME1 */
     s->regs[CHIP_REV_ID >> 2] = 0x00010100;  /* rev 1.1 */
+    /*
+     * SYSCFG (0x10): System configuration register.
+     *   Bits 3:0  = CHIP_MODE (boot device), derived from flash size:
+     *     2 = SPI-NOR 3-Byte Addr (flash <= 16 MiB),
+     *     3 = SPI-NOR 4-Byte Addr (flash >  16 MiB, e.g. 32 MiB).
+     *     U-Boot reads this in print_cpuinfo() to print the boot device.
+     *   Bit 4    = DRAM_TYPE: 0 = DDR3 (matches -m RAM).
+     *   Bits 8:6 = XTAL_MODE_SEL: 1 = 20 MHz crystal.
+     */
+    s->regs[SYSCFG >> 2] = (1U << 6) |
+        ((s->flash_size > 16 * MiB) ? 3 : 2);  /* XTAL=20MHz, DDR3, CHIP_MODE */
     /*
      * CLKCFG0 (0x2C): Clock configuration register.
      *   Bits 31:30 = CPU_CLK_SEL: 0 = 880 MHz, 1 = 440 MHz
@@ -148,6 +160,10 @@ static void mt7621_sysctl_reset_hold(Object *obj, ResetType type)
     s->regs[CUR_CLK_STS >> 2] = 0x00000101;
 }
 
+static const Property mt7621_sysctl_properties[] = {
+    DEFINE_PROP_UINT32("flash-size", MT7621SysctlState, flash_size, 0),
+};
+
 static void mt7621_sysctl_init(Object *obj)
 {
     MT7621SysctlState *s = MT7621_SYSCTL(obj);
@@ -162,6 +178,7 @@ static void mt7621_sysctl_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     dc->desc = "MT7621 System Controller";
     rc->phases.hold = mt7621_sysctl_reset_hold;
+    device_class_set_props(dc, mt7621_sysctl_properties);
 }
 
 static const TypeInfo mt7621_sysctl_info = {

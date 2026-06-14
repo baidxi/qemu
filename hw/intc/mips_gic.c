@@ -43,6 +43,7 @@ static void mips_gic_set_vp_irq(MIPSGICState *gic, int vp, int pin)
         ored_level |= (gic->vps[vp].pend & GIC_VP_MASK_CMP_MSK) >>
                       GIC_VP_MASK_CMP_SHF;
     }
+
     qemu_set_irq(gic->vps[vp].env->irq[pin + GIC_CPU_PIN_OFFSET], ored_level);
 }
 
@@ -62,6 +63,7 @@ static void gic_set_irq(void *opaque, int n_IRQ, int level)
     MIPSGICState *gic = (MIPSGICState *) opaque;
 
     gic->irq_state[n_IRQ].pending = (uint8_t) level;
+
     if (!gic->irq_state[n_IRQ].enabled) {
         /* GIC interrupt source disabled */
         return;
@@ -312,6 +314,16 @@ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
         /* EIC isn't supported */
         OFFSET_CHECK((data & GIC_MAP_MSK) <= GIC_CPU_INT_MAX);
         gic->irq_state[irq_src].map_pin = data & GIC_MAP_TO_PIN_REG_MSK;
+        /* ETH IRQ 3 must stay on pin 3 → IP5 for Breed compatibility */
+        if (irq_src == 3) {
+            uint32_t forced = GIC_MAP_TO_PIN_MSK | 3;
+            if (gic->irq_state[irq_src].map_pin != forced) {
+                fprintf(stderr, "GIC-WR: SH_MAP IRQ%u pin 0x%lx → forced to 0x%x\n",
+                        irq_src, (unsigned long)(data & GIC_MAP_TO_PIN_REG_MSK),
+                        forced);
+                gic->irq_state[irq_src].map_pin = forced;
+            }
+        }
         break;
     case GIC_SH_MAP0_VP_OFS ... GIC_SH_MAP255_VP_LAST_OFS:
         /* up to 32 bytes per a pin */
@@ -439,7 +451,8 @@ static void mips_gic_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
-    s->gic_timer = mips_gictimer_init(s, s->num_vps, gic_timer_expire_cb);
+    s->gic_timer = mips_gictimer_init(s, s->num_vps, s->clock_freq,
+                                      gic_timer_expire_cb);
     qdev_init_gpio_in(dev, gic_set_irq, s->num_irq);
     for (i = 0; i < s->num_irq; i++) {
         s->irq_state[i].irq = qdev_get_gpio_in(dev, i);
@@ -449,6 +462,7 @@ static void mips_gic_realize(DeviceState *dev, Error **errp)
 static const Property mips_gic_properties[] = {
     DEFINE_PROP_UINT32("num-vp", MIPSGICState, num_vps, 1),
     DEFINE_PROP_UINT32("num-irq", MIPSGICState, num_irq, 256),
+    DEFINE_PROP_UINT32("clock-freq", MIPSGICState, clock_freq, 0),
 };
 
 static void mips_gic_class_init(ObjectClass *klass, const void *data)

@@ -39,6 +39,7 @@ target_ulong helper_ei(CPUMIPSState *env)
     target_ulong t0 = env->CP0_Status;
 
     env->CP0_Status = t0 | (1 << CP0St_IE);
+
     return t0;
 }
 
@@ -153,12 +154,39 @@ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
 
     switch (cache_operation) {
     case 0b010: /* Index Store Tag */
-        memory_region_dispatch_write(env->itc_tag, index, env->CP0_TagLo,
-                                     MO_64, MEMTXATTRS_UNSPECIFIED);
+        if (env->itc_tag) {
+            memory_region_dispatch_write(env->itc_tag, index, env->CP0_TagLo,
+                                         MO_64, MEMTXATTRS_UNSPECIFIED);
+        }
         break;
     case 0b001: /* Index Load Tag */
-        memory_region_dispatch_read(env->itc_tag, index, &env->CP0_TagLo,
-                                    MO_64, MEMTXATTRS_UNSPECIFIED);
+        if (env->itc_tag) {
+            memory_region_dispatch_read(env->itc_tag, index, &env->CP0_TagLo,
+                                        MO_64, MEMTXATTRS_UNSPECIFIED);
+        }
+        break;
+    case 0b011: /* Index Store Data */
+        /*
+         * On real hardware this copies the CP0 data registers (DataLo /
+         * DataHi) into the cache line addressed by the index. Bootloaders
+         * such as the MT7621 U-Boot TPL exploit this to pre-load executable
+         * code into the L2 cache, which then acts as SRAM before DDR is
+         * available. QEMU has no physical cache, so emulate by writing the
+         * 8-byte data directly into system RAM at the corresponding physical
+         * address, making the code visible when execution arrives.
+         */
+        {
+            uint8_t buf[8];
+
+            if (mips_env_is_bigendian(env)) {
+                stl_be_p(buf, env->CP0_DataLo);
+                stl_be_p(buf + 4, env->CP0_DataHi);
+            } else {
+                stl_le_p(buf, env->CP0_DataLo);
+                stl_le_p(buf + 4, env->CP0_DataHi);
+            }
+            cpu_physical_memory_write(index, buf, 8);
+        }
         break;
     case 0b000: /* Index Invalidate */
     case 0b100: /* Hit Invalidate */

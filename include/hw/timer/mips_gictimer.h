@@ -27,6 +27,7 @@ struct MIPSGICTimerState {
     uint8_t countstop;
     uint32_t sh_counterlo;
     int32_t num_vps;
+    uint32_t freq;          /* counter frequency in Hz */
     MIPSGICTimerVPState *vptimers;
     MIPSGICTimerCB *cb;
 };
@@ -42,6 +43,6 @@ uint8_t mips_gictimer_get_countstop(MIPSGICTimerState *gic);
 void mips_gictimer_start_count(MIPSGICTimerState *gic);
 void mips_gictimer_stop_count(MIPSGICTimerState *gic);
 MIPSGICTimerState *mips_gictimer_init(void *opaque, uint32_t nvps,
-                                      MIPSGICTimerCB *cb);
+                                      uint32_t freq, MIPSGICTimerCB *cb);
 
 #endif /* MIPS_GICTIMER_H */

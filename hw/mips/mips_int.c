@@ -43,6 +43,14 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
         env->CP0_Cause &= ~(1 << (irq + CP0Ca_IP));
     }
 
+    /* Diagnostic: trace IP2 (ETH) level=1 only (when interrupt is SET) */
+    if (irq == 2 && level) {
+        static int ip2_set_cnt;
+        if (ip2_set_cnt < 50) {
+            ip2_set_cnt++;
+        }
+    }
+
     if (env->CP0_Cause & CP0Ca_IP_mask) {
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {

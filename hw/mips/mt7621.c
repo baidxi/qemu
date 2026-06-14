@@ -27,37 +27,33 @@
 #include "hw/mips/bootloader.h"
 #include "hw/char/serial-mm.h"
 #include "hw/core/loader.h"
+#include "exec/cpu-common.h"
+#include "qemu/timer.h"
 #include "elf.h"
 #include "system/address-spaces.h"
 #include "system/device_tree.h"
 #include "system/reset.h"
 #include "system/system.h"
-#include "system/qtest.h"
-#include "system/runstate-action.h"
 #include "hw/misc/mt7621_sysctl.h"
 #include "hw/misc/mt7621_timer.h"
 #include "hw/misc/mt7621_memctrl.h"
 #include "hw/gpio/mt7621_gpio.h"
 #include "hw/ssi/mt7621_spi.h"
 #include "hw/net/mt7621_eth.h"
+#include "net/net.h"
 #include "hw/misc/unimp.h"
 #include "system/blockdev.h"
-#include "system/block-backend.h"
 #include "system/block-backend-io.h"
 
 #include <libfdt.h>
 
 #include "hw/mips/mips_tcg_fixup.h"
 
-/* ------------------------------------------------------------------ */
-/* FDT interrupt macros (match <dt-bindings/interrupt-controller/mips-gic.h>) */
 #define FDT_GIC_SHARED     0
 #define FDT_GIC_LOCAL      1
 #define FDT_IRQ_TYPE_NONE          0
 #define FDT_IRQ_TYPE_LEVEL_HIGH    4
 
-/* ------------------------------------------------------------------ */
-/* Memory map */
 #define MT7621_DRAM_BASE        0x00000000ULL
 #define MT7621_SYSCTL_BASE      0x1E000000ULL
 #define MT7621_TIMER_BASE       0x1E000100ULL
@@ -72,6 +68,10 @@
 #define MT7621_NFI_BASE         0x1E003000ULL
 #define MT7621_MEMCTRL_BASE     0x1E005000ULL
 #define MT7621_ETH_BASE         0x1E100000ULL
+#define MT7621_PSE_SRAM_BASE    0x1E108000ULL  /* page-aligned FE PSE SRAM */
+#define MT7621_PSE_SRAM_SIZE    0x6000ULL      /* 0x1E108000–0x1E10E000 (past stack) */
+#define MT7621_STUB_SIZE        0x1000ULL      /* one 4 KiB page for entry stub */
+#define MT7621_STAGE_ENTRY_OFF  0x800          /* STAGE_LOAD_ADDR offset in stub page */
 #define MT7621_SDXC_BASE        0x1E130000ULL
 #define MT7621_PCIE_BASE        0x1E140000ULL
 #define MT7621_USB_BASE         0x1E1C0000ULL
@@ -97,16 +97,11 @@
 /* Kernel offset in flash (where Breed expects the kernel image) */
 #define MT7621_KERNEL_FLASH_OFFSET  0x50000
 
-
-/* ------------------------------------------------------------------ */
-/* GCR register offsets for bootloader */
 #define GCR_BASE_ADDR           0x1fbf8000ULL
 #define GCR_GIC_BASE_OFS        0x0080
 #define GCR_CPC_BASE_OFS        0x0088
 #define GCR_GIC_BASE_GICEN_MSK  1
 
-/* ------------------------------------------------------------------ */
-/* Machine state */
 struct MT7621State {
     /*< private >*/
     MachineState parent_obj;
@@ -124,6 +119,8 @@ struct MT7621State {
     MemoryRegion flash;       /* SPI flash (RAM-backed, read/write) */
     MemoryRegion iomem;       /* 0x1E000000 peripheral region */
     MemoryRegion dram_alias;  /* DRAM alias: wraps addresses beyond RAM size */
+    MemoryRegion pse_sram;    /* PSE SRAM: FE SRAM as code/data (SPL stage) */
+    MemoryRegion stage_stub;  /* DDR-init entry stub (jr $ra override) */
 
     /* SPI Flash backing */
     hwaddr flash_size;       /* Actual flash size (auto-detected from pflash) */
@@ -154,8 +151,6 @@ typedef struct MT7621State MT7621State;
 #define TYPE_MT7621_MACHINE   MACHINE_TYPE_NAME("mt7621")
 DECLARE_INSTANCE_CHECKER(MT7621State, MT7621_MACHINE, TYPE_MT7621_MACHINE)
 
-/* ------------------------------------------------------------------ */
-/* GIC interrupt routing (GIC shared IRQ → peripheral) */
 #define MT7621_GIC_IRQ_ETH     3
 #define MT7621_GIC_IRQ_PCIE0   4
 #define MT7621_GIC_IRQ_GPIO    12
@@ -170,8 +165,6 @@ DECLARE_INSTANCE_CHECKER(MT7621State, MT7621_MACHINE, TYPE_MT7621_MACHINE)
 #define MT7621_GIC_IRQ_UART1   27
 #define MT7621_GIC_IRQ_UART2   28
 
-/* ------------------------------------------------------------------ */
-/* FDT generation */
 static const void *mt7621_create_fdt(MT7621State *s, int *dt_size)
 {
     void *fdt;
@@ -365,8 +358,6 @@ static const void *mt7621_create_fdt(MT7621State *s, int *dt_size)
     return fdt;
 }
 
-/* ------------------------------------------------------------------ */
-/* FDT filter: called before boot to patch in runtime values */
 static void *mt7621_fdt_filter(void *opaque, const void *fdt_orig,
                                const void *match_data, hwaddr *load_addr)
 {
@@ -405,8 +396,6 @@ static void *mt7621_fdt_filter(void *opaque, const void *fdt_orig,
     return g_steal_pointer(&fdt);
 }
 
-/* ------------------------------------------------------------------ */
-/* Firmware / bootloader generation */
 static void mt7621_gen_firmware(void *p, hwaddr kernel_entry, hwaddr fdt_addr)
 {
     /*
@@ -439,9 +428,6 @@ static void mt7621_gen_firmware(void *p, hwaddr kernel_entry, hwaddr fdt_addr)
         true, 0, true, 0,     /* a2 = a3 = 0 */
         kernel_entry);
 }
-
-/* ------------------------------------------------------------------ */
-/* SPI Flash helpers */
 
 /*
  * Flash size detection: round up to standard SPI NOR flash sizes.
@@ -483,8 +469,233 @@ static void mt7621_flash_save(Notifier *notifier, void *data)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Machine initialization */
+/*
+ * The MT7621 SPL copies a proprietary MediaTek DDR-calibration blob to
+ * STAGE_LOAD_ADDR (0xBE108800, physical 0x1E108800) and calls it to
+ * initialise DDR3.  The blob performs analog PHY calibration that cannot
+ * be emulated by QEMU and also contains MIPS64 instructions (e.g. daui)
+ * that are invalid on the MIPS32 1004Kc.
+ *
+ * Since QEMU already provides functional DRAM, we overlay a read-only
+ * page at STAGE_LOAD_ADDR whose first two instructions are
+ *   jr $ra ; nop
+ * so the SPL treats the stage binary as a no-op and continues its own
+ * initialisation (cache flush, BSS clear, board_init_f, …).
+ *
+ * The stub occupies one full 4 KiB page (0x1E108000–0x1E108FFF) so that
+ * the TLB never sees a mixed RAM/IO page.  STAGE_LOAD_ADDR falls at
+ * offset 0x800 within this page.  The remaining PSE SRAM pages
+ * (0x1E109000+, including the stack at 0xBE10DFF0) are plain RAM.
+ */
+static uint64_t mt7621_stage_stub_read(void *opaque, hwaddr offset,
+                                        unsigned size)
+{
+    /* jr $ra = 0x03e00008, nop = 0x00000000  (little-endian) */
+    static const uint8_t stub[8] = {
+        0x08, 0x00, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00
+    };
+    uint64_t val = 0;
+
+    /* Only the 8 bytes at MT7621_STAGE_ENTRY_OFF contain the stub.
+     * Everything else in the page reads as zero. */
+    if (offset >= MT7621_STAGE_ENTRY_OFF &&
+        offset + size <= MT7621_STAGE_ENTRY_OFF + sizeof(stub)) {
+        memcpy(&val, stub + (offset - MT7621_STAGE_ENTRY_OFF), size);
+    }
+    return val;
+}
+
+static void mt7621_stage_stub_write(void *opaque, hwaddr offset,
+                                     uint64_t val, unsigned size)
+{
+    /* Discard all writes — protect the jr $ra stub from being
+     * overwritten by prepare_stage_bin(). */
+}
+
+static const MemoryRegionOps mt7621_stage_stub_ops = {
+    .read       = mt7621_stage_stub_read,
+    .write      = mt7621_stage_stub_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid      = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * Post-reset callback: re-enable the ETH GIC interrupt source.
+ *
+ * gic_reset() (registered via qemu_register_reset during CPS/GIC init)
+ * clears irq_state[].enabled for all sources.  Our handler is registered
+ * AFTER the GIC handler, so it runs AFTER gic_reset() and restores the
+ * ETH (IRQ 3) enable bit — simulating what the MT7621 boot ROM does
+ * before Breed runs.
+ *
+ * We write directly to the GIC state struct instead of going through
+ * the MMIO dispatch, because gic_write() dereferences current_cpu which
+ * may be NULL during the reset phase.  After gic_reset(), the map_pin
+ * field is GIC_MAP_TO_PIN_MSK (pin 0 → CPU IP2) and map_vp is 0, which
+ * is the correct routing for the MT7621 ETH interrupt.
+ */
+static void mt7621_enable_eth_gic_irq(void *opaque)
+{
+    MIPSCPSState *cps = (MIPSCPSState *)opaque;
+    cps->gic.irq_state[MT7621_GIC_IRQ_ETH].enabled = 1;
+
+    /*
+     * MT7621 boot ROM enables IM2 (CP0_Status bit 10) for GIC interrupts
+     * before the bootloader runs.  Breed relies on this pre-configured
+     * mask.  Set it here (after CPU reset) to match real hardware.
+     *
+     * The boot ROM also configures vectored interrupt mode
+     * (Cause.IV = 1, IntCtl.VS = 1 → 32 bytes per vector) so that
+     * each GIC interrupt pin gets its own handler entry point.
+     * Without IV=1, all interrupts go to offset 0x200 (generic
+     * handler), and Breed's generic handler may not recognize IP2
+     * as the Ethernet interrupt — causing an infinite wait loop.
+     *
+     * Also force the GIC pin mapping to route ETH IRQ 3 → pin 3 → IP5
+     * (instead of the default pin 0 → IP2).  Breed enables IM5 as well
+     * as IM2 (mask 0xa4 = IP2|IP5|IP7), and may have an Ethernet-specific
+     * handler on IP5 that correctly processes the RX ring and clears the
+     * interrupt status.
+     */
+    cps->gic.irq_state[MT7621_GIC_IRQ_ETH].map_pin =
+        GIC_MAP_TO_PIN_MSK | 3;                  /* MAP=3 → pin 3 → IP5 */
+    cps->gic.irq_state[MT7621_GIC_IRQ_ETH].map_vp = 0;
+
+    if (cps->gic.num_vps > 0 && cps->gic.vps[0].env) {
+        CPUMIPSState *env = cps->gic.vps[0].env;
+        env->CP0_Status  |= (1u << 10);           /* IM2 */
+        env->CP0_Status  |= (1u << 13);           /* IM5 */
+        env->CP0_Cause   |= (1u << CP0Ca_IV);     /* Vectored Interrupts */
+        env->CP0_IntCtl  |= (1u << CP0IntCtl_VS); /* spacing = 1 (32 bytes) */
+        env->CP0_Config3 |= (1u << CP0C3_VEIC);   /* EIC mode for GIC */
+    }
+}
+
+/*
+ * DTB "broken-flash-reset" patcher.
+ *
+ * OpenWrt's device tree for many MT7621 boards (including Newifi D2)
+ * sets the boolean "broken-flash-reset" property on the SPI-NOR node.
+ * The kernel's spi-nor subsystem checks this property and, when the
+ * flash is ≥ 16 MiB (requiring 4-byte addressing), emits:
+ *
+ *   WARNING: ... at drivers/mtd/spi-nor/core.c:3228
+ *   "enabling reset hack; may not recover from unexpected reboots"
+ *
+ * In QEMU there is no physical RESET# pin, so the warning is spurious.
+ * The DTB is embedded inside the compressed kernel payload on the flash
+ * and cannot be patched directly in the image.  Instead, after the
+ * kernel's LZMA loader decompresses the kernel (with its appended DTB)
+ * into RAM, a periodic timer scans guest RAM for the FDT magic
+ * (0xD00DFEED) and corrupts the "broken-flash-reset" string so that
+ * of_property_read_bool() no longer matches it.
+ */
+static QEMUTimer *dtb_patch_timer;
+static bool dtb_patched;
+
+#define DTB_MAGIC       0xD00DFEED
+#define DTB_SCAN_START  0x00000000ULL   /* physical RAM base (kseg0 0x80000000) */
+#define DTB_SCAN_END    0x01000000ULL   /* 16 MiB window covers kernel+DTB */
+#define DTB_SCAN_CHUNK  0x40000         /* 256 KiB */
+#define DTB_RETRY_MS    1               /* retry every 1 ms virt (race DTB parse) */
+
+static void mt7621_dtb_patch_cb(void *opaque)
+{
+    static int retry_count;
+    static hwaddr last_dtb_addr = ~(hwaddr)0;
+    uint8_t *buf;
+
+    if (dtb_patched) {
+        return;
+    }
+
+    if (retry_count == 0) {
+        fprintf(stderr, "mt7621: DTB patch timer first fire at %lld ns\n",
+                (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    retry_count++;
+
+    buf = g_malloc(DTB_SCAN_CHUNK + 8);
+
+    for (hwaddr base = DTB_SCAN_START; base < DTB_SCAN_END;
+         base += DTB_SCAN_CHUNK) {
+        hwaddr len = DTB_SCAN_CHUNK + 8;
+        if (base + len > DTB_SCAN_END) {
+            len = DTB_SCAN_END - base;
+        }
+        if (len < 8) {
+            break;
+        }
+
+        cpu_physical_memory_read(base, buf, len);
+
+        for (int i = 0; i <= (int)(len - 8); i += 4) {
+            uint32_t magic = ldl_be_p(buf + i);
+            uint32_t totalsize;
+
+            if (magic != DTB_MAGIC) {
+                continue;
+            }
+            totalsize = ldl_be_p(buf + i + 4);
+            if (totalsize < 0x100 || totalsize > 0x10000) {
+                continue;   /* not a plausible DTB */
+            }
+
+            /* Only log when a new DTB address appears (avoid spam) */
+            if (base + i != last_dtb_addr) {
+                last_dtb_addr = base + i;
+                fprintf(stderr, "mt7621: DTB magic at RAM phys 0x%llx "
+                        "totalsize=0x%x\n",
+                        (unsigned long long)(base + i), totalsize);
+            }
+
+            /* Read the full DTB blob from guest RAM */
+            uint8_t *dtb = g_malloc(totalsize);
+            cpu_physical_memory_read(base + i, dtb, totalsize);
+
+            uint8_t *p = memmem(dtb, totalsize,
+                                "broken-flash-reset", 18);
+            if (p) {
+                /*
+                 * Corrupt the property name so the kernel's
+                 * of_property_read_bool(np, "broken-flash-reset")
+                 * returns false.
+                 */
+                hwaddr patch_off = base + i + (p - dtb);
+                uint8_t replacement = 'x';
+                cpu_physical_memory_write(patch_off, &replacement, 1);
+                fprintf(stderr, "mt7621: PATCHED broken-flash-reset "
+                        "at DTB phys 0x%llx + 0x%tx\n",
+                        (unsigned long long)(base + i),
+                        (ptrdiff_t)(p - dtb));
+                dtb_patched = true;
+            }
+            g_free(dtb);
+            if (dtb_patched) {
+                goto done;
+            }
+        }
+    }
+
+done:
+    g_free(buf);
+
+    if (!dtb_patched) {
+        /* Kernel not decompressed yet — retry in DTB_RETRY_MS ms */
+        timer_mod(dtb_patch_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  DTB_RETRY_MS * 1000000LL);
+    }
+}
+
+static void mt7621_dtb_patch_reset(void *opaque)
+{
+    dtb_patched = false;
+    /* Start scanning 5 ms after reset (give the loader time to run) */
+    timer_mod(dtb_patch_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5000000);
+}
+
 static void mt7621_machine_init(MachineState *machine)
 {
     MT7621State *s = MT7621_MACHINE(machine);
@@ -688,29 +899,6 @@ static void mt7621_machine_init(MachineState *machine)
     }
 
     /*
-     * XIP shadow copy: On MT7621, SPI flash is also accessible at
-     * physical address 0 (XIP boot mode).  Copy flash content into the
-     * beginning of DRAM so "boot mem 0x50000" reads the kernel image
-     * from flash via physical 0, while writes go to DRAM.
-     *
-     * Flash at 0x1FC00000 is in the GAP region (not DRAM), so the reset
-     * vector is served by the flash MemoryRegion directly — no shadow
-     * copy needed there.
-     */
-    {
-        /*
-         * DIAGNOSIS: XIP shadow copy disabled.
-         * The shadow copy fills DRAM[0..flash_size] with flash content,
-         * including erased sectors (0xFF). If Breed's heap overlaps with
-         * this region, dlmalloc reads 0xFFFFFFFF as valid chunk headers,
-         * causing heap corruption and allocation failures.
-         */
-        /* uint8_t *dram_ptr = memory_region_get_ram_ptr(machine->ram); */
-        /* hwaddr xip_size = MIN(s->flash_size, machine->ram_size); */
-        /* memcpy(dram_ptr, s->flash_data, xip_size); */
-    }
-
-    /*
      * Breed bootloader dlmalloc workaround (version-independent).
      *
      * Breed's dlmalloc has a bug in its non-contiguous MORECORE path:
@@ -766,6 +954,9 @@ static void mt7621_machine_init(MachineState *machine)
     /* ---- SYSCTL (system controller: chip ID, clocks, reset) ---- */
     {
         DeviceState *sysctl_dev = qdev_new(TYPE_MT7621_SYSCTL);
+        /* Report flash size so SYSCFG.CHIP_MODE selects the right SPI-NOR
+         * addressing mode: 3-Byte for <= 16 MiB, 4-Byte for > 16 MiB. */
+        qdev_prop_set_uint32(sysctl_dev, "flash-size", s->flash_size);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sysctl_dev), &error_fatal);
         /* Map with overlap priority 0 (highest) to ensure it wins over
          * the CPS container at priority 1 */
@@ -773,12 +964,57 @@ static void mt7621_machine_init(MachineState *machine)
                                 MT7621_SYSCTL_BASE, 0);
     }
 
-    /* ---- Ethernet Frame Engine stub ---- */
+    /* ---- Ethernet Frame Engine (PDMA + NIC) ---- */
     {
         DeviceState *eth_dev = qdev_new(TYPE_MT7621_ETH);
+        qemu_configure_nic_device(eth_dev, true, "mt7621-eth");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(eth_dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(eth_dev), 0, MT7621_ETH_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(eth_dev), 0,
+                           get_cps_irq(&s->cps, MT7621_GIC_IRQ_ETH));
+
+        /*
+         * Register a post-reset handler that pre-enables the ETH GIC
+         * interrupt (GIC_SH_SMASK, IRQ 3).  The MT7621 boot ROM enables
+         * GIC interrupt sources before the bootloader runs.  Breed's
+         * rt2880-eth driver only touches FE-level interrupt registers
+         * (0x0028/0x0A28), expecting the GIC source to be already
+         * enabled.  Without this, the RX-done interrupt never reaches
+         * the CPU.
+         *
+         * We must use a qemu_register_reset callback (not a direct
+         * write during init) because gic_reset() clears all enabled
+         * bits and runs AFTER board init.  Our handler is registered
+         * after the GIC's handler, so it executes AFTER gic_reset().
+         */
+        if ((machine->firmware || has_pflash) && !machine->kernel_filename) {
+            qemu_register_reset(mt7621_enable_eth_gic_irq, &s->cps);
+        }
     }
+
+    /* ---- PSE SRAM (FE SRAM repurposed as code/data by SPL) ---- */
+    /*
+     * The MT7621 SPL uses the Packet Switch Engine SRAM (within the FE
+     * block) as temporary code and stack space before DDR is available.
+     * Create a page-aligned RAM-backed region (priority 1) so the SPL can:
+     *   - use a temporary stack at 0xBE10DFF0
+     *   - store data in the FE SRAM
+     * Then overlay a single page (priority 2) that returns 'jr $ra; nop'
+     * at STAGE_LOAD_ADDR (offset 0x800) so the DDR-init blob is a no-op.
+     *
+     * Both regions are page-aligned (base 0x1E108000) so that the TCG TLB
+     * never needs to handle a page that mixes RAM and MMIO.
+     */
+    memory_region_init_ram(&s->pse_sram, NULL, "mt7621-pse-sram",
+                           MT7621_PSE_SRAM_SIZE, &error_fatal);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MT7621_PSE_SRAM_BASE,
+                                        &s->pse_sram, 1);
+    memory_region_init_io(&s->stage_stub, NULL, &mt7621_stage_stub_ops,
+                          s, "mt7621-stage-stub", MT7621_STUB_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MT7621_PSE_SRAM_BASE,
+                                        &s->stage_stub, 2);
 
     /* ---- SPI Controller (shares flash_data buffer) ---- */
     {
@@ -840,6 +1076,15 @@ static void mt7621_machine_init(MachineState *machine)
 
     /* flash-boot mode: all peripherals created, skip FDT+kernel */
     if ((machine->firmware || has_pflash) && !machine->kernel_filename) {
+        /*
+         * Set up the DTB broken-flash-reset patcher for flash-boot mode.
+         * The kernel (inside the flash image) contains its own appended
+         * DTB with the broken-flash-reset property.  A periodic timer
+         * scans guest RAM after kernel decompression to neutralise it.
+         */
+        dtb_patch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       mt7621_dtb_patch_cb, NULL);
+        qemu_register_reset(mt7621_dtb_patch_reset, NULL);
         return;  /* CPU will boot from flash at 0xBFC00000 */
     }
 
@@ -907,8 +1152,6 @@ static void mt7621_machine_init(MachineState *machine)
     mt7621_gen_firmware(s->flash_data, kernel_entry, dtb_vaddr);
 }
 
-/* ------------------------------------------------------------------ */
-/* Machine class */
 static bool mt7621_machine_get_flash_writable(Object *obj, Error **errp)
 {
     MT7621State *s = MT7621_MACHINE(obj);

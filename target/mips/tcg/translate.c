@@ -14709,10 +14709,14 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_CACHE:
         check_cp0_enabled(ctx);
         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
-        if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
-            gen_cache_operation(ctx, rt, rs, imm);
-        }
-        /* Treat as NOP. */
+        /*
+         * Always dispatch to the cache helper. When ITC is enabled
+         * (MIPS_HFLAG_ITC_CACHE) it operates on ITC tags; otherwise the
+         * helper emulates operations such as Index Store Data, which some
+         * bootloaders (e.g. MT7621 U-Boot TPL) use to pre-load code into
+         * the L2 cache acting as SRAM.
+         */
+        gen_cache_operation(ctx, rt, rs, imm);
         break;
     case OPC_PREF:
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1 | INSN_R5900);

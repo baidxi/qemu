@@ -213,6 +213,7 @@ struct MIPSGICState {
 
     uint32_t num_vps;
     uint32_t num_irq;
+    uint32_t clock_freq;        /* GIC counter frequency in Hz */
 };
 
 #endif /* MIPS_GIC_H */
