@@ -154,9 +154,23 @@ static void gcr_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
                                get_exception_base(current_vps));
         break;
     case MIPS_COCB_OFS + GCR_CL_RESETBASE_OFS:
-        other_vps->reset_base = data & GCR_CL_RESET_BASE_MSK;
-        cpu_set_exception_base(current_vps->other,
-                               get_exception_base(other_vps));
+        /*
+         * boot_core() selects a *core* via GCR_CL_OTHER.CORENUM then writes
+         * the core's reset vector here.  Map the core number to its VPE0
+         * (cpu_index = core * vpes_per_core) so the reset vector lands on
+         * the correct physical CPU.  MT7621A has 2 VPEs per core.
+         */
+        {
+            unsigned int num_cores = gcr->num_vps / 2;
+            unsigned int vpc = gcr->num_vps / (num_cores ? num_cores : 1);
+            unsigned int vpe0 = current_vps->other * vpc;
+
+            if (vpe0 < gcr->num_vps) {
+                gcr->vps[vpe0].reset_base = data & GCR_CL_RESET_BASE_MSK;
+                cpu_set_exception_base(vpe0,
+                                       get_exception_base(&gcr->vps[vpe0]));
+            }
+        }
         break;
     case MIPS_CLCB_OFS + GCR_CL_OTHER_OFS:
         if ((data & GCR_CL_OTHER_MSK) < gcr->num_vps) {

@@ -74,6 +74,50 @@ static void cpc_stop_vp(MIPSCPCState *cpc, uint64_t vp_stop)
     }
 }
 
+/*
+ * Boot the VPE0 of the core selected via CPC_CL_OTHER.CORENUM.  MT7621
+ * has 2 VPEs per core, so core N's VPE0 is at cpu_index N*vpes_per_core.
+ */
+static void cpc_boot_selected_core(MIPSCPCState *s)
+{
+    unsigned int num_cores = s->num_vp / 2;
+    unsigned int vpes_per_core, vpe0;
+
+    if (num_cores == 0) {
+        num_cores = 1;
+    }
+    vpes_per_core = s->num_vp / num_cores;
+    vpe0 = s->other_core * vpes_per_core;
+    if (vpe0 < s->num_vp) {
+        cpc_run_vp(s, 1ULL << vpe0);
+    }
+}
+
+/*
+ * Translate a per-core VP mask (written to the core-other VP_RUN/VP_STOP
+ * registers) into a global cpu_index mask.  For MT7621A (2 VPEs/core) core
+ * C's VP i maps to cpu_index C*vpes_per_core + i.
+ */
+static uint64_t cpc_co_vp_global_mask(MIPSCPCState *s, uint64_t per_core_mask)
+{
+    unsigned int num_cores = s->num_vp / 2;
+    unsigned int vpc, base;
+    uint64_t global = 0;
+    int i;
+
+    if (num_cores == 0) {
+        num_cores = 1;
+    }
+    vpc = s->num_vp / num_cores;
+    base = s->other_core * vpc;
+    for (i = 0; i < (int)vpc && (base + i) < s->num_vp; i++) {
+        if (per_core_mask & (1ULL << i)) {
+            global |= 1ULL << (base + i);
+        }
+    }
+    return global & cpc_vp_run_mask(s);
+}
+
 static void cpc_write(void *opaque, hwaddr offset, uint64_t data,
                       unsigned size)
 {
@@ -81,12 +125,32 @@ static void cpc_write(void *opaque, hwaddr offset, uint64_t data,
 
     switch (offset) {
     case CPC_CL_BASE_OFS + CPC_VP_RUN_OFS:
-    case CPC_CO_BASE_OFS + CPC_VP_RUN_OFS:
         cpc_run_vp(s, data & cpc_vp_run_mask(s));
         break;
+    case CPC_CO_BASE_OFS + CPC_VP_RUN_OFS:
+        /* core-other: mask is per-core, map to the selected core's VPs */
+        cpc_run_vp(s, cpc_co_vp_global_mask(s, data));
+        break;
     case CPC_CL_BASE_OFS + CPC_VP_STOP_OFS:
-    case CPC_CO_BASE_OFS + CPC_VP_STOP_OFS:
         cpc_stop_vp(s, data & cpc_vp_run_mask(s));
+        break;
+    case CPC_CO_BASE_OFS + CPC_VP_STOP_OFS:
+        cpc_stop_vp(s, cpc_co_vp_global_mask(s, data));
+        break;
+    case CPC_CL_BASE_OFS + CPC_Cx_OTHER_OFS:
+        /* CPC_CL_OTHER: select the core targeted by core-other accesses */
+        s->other_core = (data >> CPC_Cx_OTHER_CORENUM_SHIFT) & 0xff;
+        break;
+    case CPC_CL_BASE_OFS + CPC_Cx_CMD_OFS:
+    case CPC_CO_BASE_OFS + CPC_Cx_CMD_OFS:
+        /*
+         * CPC_Cx_CMD: the guest (kernel boot_core / U-Boot SPL) requests a
+         * core power-up/reset.  For RESET/PWRUP, start the selected core's
+         * VPE0 so the kernel's boot_core() sequence completes.
+         */
+        if ((data & 0xf) == CPC_Cx_CMD_RESET) {
+            cpc_boot_selected_core(s);
+        }
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -103,6 +167,14 @@ static uint64_t cpc_read(void *opaque, hwaddr offset, unsigned size)
     case CPC_CL_BASE_OFS + CPC_VP_RUNNING_OFS:
     case CPC_CO_BASE_OFS + CPC_VP_RUNNING_OFS:
         return s->vp_running;
+    case CPC_CL_BASE_OFS + CPC_Cx_STAT_CONF_OFS:
+    case CPC_CO_BASE_OFS + CPC_Cx_STAT_CONF_OFS:
+        /*
+         * boot_core() polls SEQSTATE for U6 (coherent execution) to decide
+         * the core has powered up.  Report U6 unconditionally so the poll
+         * completes (the VPE is started synchronously via cpc_run_vp above).
+         */
+        return CPC_SEQSTATE_U6;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "%s: Bad offset 0x%x\n",  __func__, (int)offset);

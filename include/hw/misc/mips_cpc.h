@@ -30,9 +30,15 @@
 #define CPC_CO_BASE_OFS     0x4000
 
 /* CPC register offsets relative to block offsets */
+#define CPC_Cx_CMD_OFS      0x00    /* command sequencer */
+#define CPC_Cx_CMD_RESET    0x4
+#define CPC_Cx_STAT_CONF_OFS 0x08   /* status / config */
+#define CPC_Cx_OTHER_OFS    0x10    /* core-other selection */
+#define CPC_Cx_OTHER_CORENUM_SHIFT  16
 #define CPC_VP_STOP_OFS     0x20
 #define CPC_VP_RUN_OFS      0x28
 #define CPC_VP_RUNNING_OFS  0x30
+#define CPC_SEQSTATE_U6     (0x7 << 19)  /* coherent execution (core up) */
 
 #define TYPE_MIPS_CPC "mips-cpc"
 OBJECT_DECLARE_SIMPLE_TYPE(MIPSCPCState, MIPS_CPC)
@@ -45,6 +51,12 @@ struct MIPSCPCState {
 
     MemoryRegion mr;
     uint64_t vp_running; /* Indicates which VPs are in the run state */
+
+    /*
+     * Core selected by the guest via CPC_CL_OTHER.CORENUM, used to target
+     * the per-core command (CPC_Cx_CMD) at a specific core's VPE0.
+     */
+    uint32_t other_core;
 };
 
 #endif /* MIPS_CPC_H */

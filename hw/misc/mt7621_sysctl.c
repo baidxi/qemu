@@ -128,7 +128,15 @@ static void mt7621_sysctl_reset_hold(Object *obj, ResetType type)
 
     s->regs[CHIPID0_3 >> 2] = 0x3637544D;    /* "MT76" == MT7621_CHIP_NAME0 */
     s->regs[CHIPID4_7 >> 2] = 0x20203132;    /* "21  " == MT7621_CHIP_NAME1 */
-    s->regs[CHIP_REV_ID >> 2] = 0x00010100;  /* rev 1.1 */
+    /*
+     * CHIP_REV_ID (0x0C):
+     *   bit 17 CPU_ID  : 1 = dual-core (MT7621A). U-Boot SPL reads this to
+     *                     boot the secondary core (bootup_secondary_core).
+     *   bit 16 PKG_ID  : 1 = A-package.
+     *   bits 11:8 VER  : silicon version (1).
+     *   bits 3:0  ECO  : eco revision (3 for MT7621A).
+     */
+    s->regs[CHIP_REV_ID >> 2] = 0x00030103;  /* MT7621A dual-core, rev 1, eco 3 */
     /*
      * SYSCFG (0x10): System configuration register.
      *   Bits 3:0  = CHIP_MODE (boot device), derived from flash size:
